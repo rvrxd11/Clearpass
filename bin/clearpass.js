@@ -46,6 +46,19 @@ const CONFIG_PATH = path.join(process.env.HOME || process.env.USERPROFILE || '.'
 global.isCapturing = false;
 global.abortCapture = false;
 
+// Global registry of temporary files so leftovers are removed even on a hard exit.
+const globalTempPaths = new Set();
+function registerTempPath(p) { try { globalTempPaths.add(p); } catch (_) {} }
+function cleanupGlobalTempPaths() {
+  for (const p of globalTempPaths) {
+    try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch (_) {}
+  }
+  globalTempPaths.clear();
+}
+process.on('exit', cleanupGlobalTempPaths);
+process.on('SIGINT', () => { cleanupGlobalTempPaths(); process.exit(130); });
+process.on('SIGTERM', () => { cleanupGlobalTempPaths(); process.exit(143); });
+
 try {
   readline.emitKeypressEvents(process.stdin);
 } catch (_) {}
@@ -87,7 +100,7 @@ function loadConfig() {
   try {
     if (fs.existsSync(CONFIG_PATH)) return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
   } catch (_) {}
-  return { defaultFormat: 'png', maxPages: 300, outDir: './screenshots' };
+  return { defaultFormat: 'png', maxPages: 300, outDir: './screenshots', headless: true, storageStatePath: path.join(process.env.HOME || process.env.USERPROFILE || '.', '.clearpass-storage.json') };
 }
 
 function saveConfig(cfg) {
@@ -97,6 +110,8 @@ function saveConfig(cfg) {
 let config = loadConfig();
 if (config.maxPages === undefined) config.maxPages = 300;
 if (config.outDir === undefined) config.outDir = './screenshots';
+if (config.headless === undefined) config.headless = true;
+if (config.storageStatePath === undefined) config.storageStatePath = path.join(process.env.HOME || process.env.USERPROFILE || '.', '.clearpass-storage.json');
 
 // ---------- content-stability engine ----------
 async function waitForStableFrame(page, { timeoutMs = 8000, quietMs = 450, pollMs = 200 } = {}) {
@@ -133,17 +148,29 @@ async function checkForCaptcha(page) {
       if (title.includes('just a moment') || title.includes('attention required')) return 'Cloudflare / Security check';
       if (text.includes('checking if the site connection is secure') ||
           text.includes('verify you are human') ||
+          text.includes('verifying you are human') ||
+          text.includes('checking your browser before accessing') ||
+          text.includes('ddos protection by cloudflare') ||
+          text.includes('needs to review the security of your connection') ||
           text.includes('enable javascript and cookies to continue') ||
           text.includes('performance & security by cloudflare') ||
           text.includes('ray id:')) return 'Cloudflare / Security check';
       if (document.querySelector('iframe[src*="recaptcha"]')) return 'reCAPTCHA';
       if (document.querySelector('iframe[src*="hcaptcha"]')) return 'hCaptcha';
+      if (document.querySelector('iframe[src*="funcaptcha"]') ||
+          document.querySelector('iframe[src*="arkose"]') ||
+          document.querySelector('iframe[src*="geetest"]')) return 'Other CAPTCHA';
       if (document.querySelector('iframe[src*="challenges.cloudflare.com"]') ||
           document.querySelector('iframe[src*="turnstile"]') ||
           document.querySelector('#challenge-running') ||
           document.querySelector('#challenge-form') ||
           document.querySelector('#challenge-stage') ||
-          document.querySelector('#cf-challenge-running')) return 'Cloudflare Turnstile';
+          document.querySelector('#cf-challenge-running') ||
+          document.querySelector('#cf-browser-verification') ||
+          document.querySelector('#challenge-platform') ||
+          document.querySelector('#cf-please-wait') ||
+          document.querySelector('.cf-spinner') ||
+          document.querySelector('.cf-wrapper')) return 'Cloudflare Turnstile';
       return null;
     });
     return isCaptcha;
@@ -154,11 +181,53 @@ async function checkForCaptcha(page) {
 
 async function settlePage(page) {
   await page.waitForLoadState('domcontentloaded').catch(() => {});
+  const initialUrl = page.url();
 
-  // Advanced wait: up to ~60s with exponential backoff for Cloudflare/Security challenges.
-  const deadline = Date.now() + 60000;
+  // Advanced wait: up to ~90s with exponential backoff for Cloudflare/Security challenges.
+  const deadline = Date.now() + 90000;
   let wasBlocked = false;
   let attempt = 0;
+
+  const clickChallenge = async () => {
+    // Cloudflare Turnstile checkbox / managed challenge button
+    try {
+      const cf = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
+      const box = cf.locator('input[type="checkbox"]').first();
+      if (await box.count().catch(() => 0)) {
+        if (await box.isVisible().catch(() => false)) {
+          await box.click({ timeout: 1500 }).catch(() => {});
+          return true;
+        }
+      }
+      const btn = cf.locator('button').first();
+      if (await btn.count().catch(() => 0)) {
+        if (await btn.isVisible().catch(() => false)) {
+          await btn.click({ timeout: 1500 }).catch(() => {});
+          return true;
+        }
+      }
+    } catch (_) {}
+    // reCAPTCHA anchor checkbox
+    try {
+      const rc = page.frameLocator('iframe[src*="recaptcha"]').first();
+      const anchor = rc.locator('#recaptcha-anchor');
+      if (await anchor.count().catch(() => 0)) {
+        await anchor.click({ timeout: 1500 }).catch(() => {});
+        return true;
+      }
+    } catch (_) {}
+    // hCaptcha checkbox
+    try {
+      const hc = page.frameLocator('iframe[src*="hcaptcha"]').first();
+      const box = hc.locator('#checkbox').first();
+      if (await box.count().catch(() => 0)) {
+        await box.click({ timeout: 1500 }).catch(() => {});
+        return true;
+      }
+    } catch (_) {}
+    return false;
+  };
+
   try {
     while (Date.now() < deadline) {
       const title = (await page.title().catch(() => '')).toLowerCase();
@@ -174,28 +243,32 @@ async function settlePage(page) {
           await page.waitForTimeout(2000);
           break;
         }
-        // Opportunistically click a visible Turnstile checkbox to help auto-solve.
-        try {
-          const frame = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
-          const box = frame.locator('input[type="checkbox"]').first();
-          if (await box.count()) {
-            const visible = await box.isVisible().catch(() => false);
-            if (visible) {
-              await box.click({ timeout: 1500 }).catch(() => {});
-            }
-          }
-        } catch (_) {}
+        await clickChallenge();
         await page.waitForTimeout(waitMs);
       } else {
+        if (page.url() !== initialUrl) {
+          await page.waitForLoadState('domcontentloaded').catch(() => {});
+          await page.waitForTimeout(500);
+        }
         break;
       }
     }
   } catch (e) {}
 
   if (wasBlocked) {
-    // Give the redirect after "verification successful" time to land.
     await page.waitForLoadState('domcontentloaded').catch(() => {});
-    await page.waitForTimeout(2000);
+    // Wait until the challenge UI is gone (or timeout) so we don't snapshot the security screen.
+    await page.waitForFunction(() => {
+      const t = (document.title || '').toLowerCase();
+      const txt = document.body ? document.body.innerText.toLowerCase() : '';
+      return !(t.includes('just a moment') ||
+               t.includes('attention required') ||
+               txt.includes('verify you are human') ||
+               txt.includes('verifying you are human') ||
+               txt.includes('checking if the site connection is secure') ||
+               txt.includes('checking your browser before accessing'));
+    }, { timeout: 20000 }).catch(() => {});
+    await page.waitForTimeout(1500);
   }
 
   await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
@@ -292,7 +365,7 @@ async function downloadNativeGoogleSlides(page, startUrl, format, outDir) {
   return true; 
 }
 
-async function crawlPresentation(context, startUrl, { outDir, imgFormat, maxPages, progressBar }) {
+async function crawlPresentation(context, startUrl, { outDir, imgFormat, maxPages, progressBar, tempPaths = [], cleanup = false }) {
   const page = await context.newPage();
   let pageTitle = '';
   const trackingLog = [];
@@ -324,7 +397,6 @@ async function crawlPresentation(context, startUrl, { outDir, imgFormat, maxPage
     let sameFrameCount = 0;
     let lastFrameHash = await waitForStableFrame(page);
     let isFirstSlide = true;
-    const tempPaths = [];
 
     while (slideNum <= target && iterations < maxIterations) {
       if (global.abortCapture) {
@@ -365,6 +437,7 @@ async function crawlPresentation(context, startUrl, { outDir, imgFormat, maxPage
       const finalPath = uniquePath(outDir, filename, imgFormat);
       await page.screenshot({ path: finalPath, fullPage: false, type: imgFormat });
       tempPaths.push(finalPath);
+      if (cleanup) registerTempPath(finalPath);
 
       const pageW = await page.evaluate(() => window.innerWidth);
       const pageH = await page.evaluate(() => window.innerHeight);
@@ -397,11 +470,10 @@ async function crawlPresentation(context, startUrl, { outDir, imgFormat, maxPage
   return { trackingLog, title: pageTitle, tempPaths };
 }
 
-async function crawlWebsite(context, startUrl, { outDir, imgFormat, maxPages, maxDepth, sameDomainOnly, progressBar }) {
+async function crawlWebsite(context, startUrl, { outDir, imgFormat, maxPages, maxDepth, sameDomainOnly, progressBar, tempPaths = [], cleanup = false }) {
   const visited = new Set();
   const queue = [{ url: startUrl.href, depth: 0 }];
   const trackingLog = [];
-  const tempPaths = [];
   let pageTitle = '';
   let count = 0;
   
@@ -436,6 +508,7 @@ async function crawlWebsite(context, startUrl, { outDir, imgFormat, maxPages, ma
       const finalPath = uniquePath(outDir, filename, imgFormat);
       await page.screenshot({ path: finalPath, fullPage: true, type: imgFormat });
       tempPaths.push(finalPath);
+      if (cleanup) registerTempPath(finalPath);
       trackingLog.push({ url, file: path.basename(finalPath), filepath: finalPath });
 
       count++;
@@ -465,7 +538,7 @@ async function crawlWebsite(context, startUrl, { outDir, imgFormat, maxPages, ma
 }
 
 // ---------- scrape text ----------
-async function scrapeWebsiteText(context, startUrl, { outDir, maxPages, maxDepth, sameDomainOnly, progressBar }) {
+async function scrapeWebsiteText(context, startUrl, { outDir, maxPages, maxDepth, sameDomainOnly, progressBar, tempPaths = [], cleanup = false }) {
   const visited = new Set();
   const queue = [{ url: startUrl.href, depth: 0 }];
   const trackingLog = [];
@@ -506,6 +579,8 @@ async function scrapeWebsiteText(context, startUrl, { outDir, maxPages, maxDepth
       const filename = urlToFilename(url, 'md', urlTitle);
       const finalPath = uniquePath(outDir, filename, 'md');
       fs.writeFileSync(finalPath, markdown, 'utf8');
+      tempPaths.push(finalPath);
+      if (cleanup) registerTempPath(finalPath);
       trackingLog.push({ url, file: path.basename(finalPath), filepath: finalPath, markdown });
 
       count++;
@@ -688,7 +763,7 @@ async function captureMhtml(context, startUrl, outDir) {
 }
 
 // ---------- execution router ----------
-async function runCapture(browser, args) {
+async function runCapture(browser, args, options = {}) {
   const startUrl = new URL(args.url);
   const outDir = path.resolve(args.outDir || config.outDir);
   let format = ['png', 'jpeg', 'pptx', 'docx', 'pdf', 'mhtml'].includes((args.format || config.defaultFormat).toLowerCase())
@@ -703,14 +778,19 @@ async function runCapture(browser, args) {
   const maxPages = args.maxPages || config.maxPages;
   const maxDepth = args.depth || 0;
   const sameDomainOnly = args.sameDomainOnly !== false;
+  const storageStatePath = options.storageStatePath || path.join(process.env.HOME || process.env.USERPROFILE || '.', '.clearpass-storage.json');
 
   if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+
+  let storageState;
+  try { if (fs.existsSync(storageStatePath)) storageState = JSON.parse(fs.readFileSync(storageStatePath, 'utf8')); } catch (_) {}
 
   const context = await browser.newContext({
     viewport: { width: 1440, height: 900 },
     userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     locale: 'en-US',
     timezoneId: 'America/New_York',
+    storageState,
   });
   await context.addInitScript(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => false });
@@ -735,6 +815,17 @@ async function runCapture(browser, args) {
   let trackingLog = [];
   let pageTitle = '';
   const allTempPaths = [];
+  const shouldCleanupTemp = ['pptx', 'docx', 'pdf'].includes(format);
+  const cleanupTemp = (force = false) => {
+    if (!force && !shouldCleanupTemp) return;
+    const targets = new Set(allTempPaths);
+    for (const item of trackingLog) {
+      if (item && item.filepath) targets.add(item.filepath);
+    }
+    for (const p of targets) {
+      try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch (_) {}
+    }
+  };
   global.isCapturing = true;
   global.abortCapture = false;
 
@@ -756,15 +847,19 @@ async function runCapture(browser, args) {
         global.isCapturing = false;
         global.abortCapture = false;
         if (progressBar.isActive) progressBar.stop();
+        try {
+          if (options.storageStatePath !== false) {
+            await context.storageState({ path: storageStatePath }).catch(() => {});
+          }
+        } catch (_) {}
         try { await context.close(); } catch (_) {}
-        return;
+        return true;
       }
       // Fallback: crawl it like a generic presentation
       console.log(chalk.yellow(`\nCapturing Google Slides via visual crawler fallback...`));
-      const crawlResult = await crawlPresentation(context, startUrl, { outDir, imgFormat: ['pptx', 'docx', 'pdf'].includes(format) ? 'png' : format, maxPages, progressBar });
+      const crawlResult = await crawlPresentation(context, startUrl, { outDir, imgFormat: ['pptx', 'docx', 'pdf'].includes(format) ? 'png' : format, maxPages, progressBar, tempPaths: allTempPaths, cleanup: shouldCleanupTemp });
       trackingLog = crawlResult.trackingLog;
       pageTitle = crawlResult.title;
-      if (crawlResult.tempPaths) allTempPaths.push(...crawlResult.tempPaths);
     } else if (format === 'mhtml') {
       console.log(chalk.yellow(`\nCreating interactive MHTML archive for ${startUrl.href}`));
       const mhtmlResult = await captureMhtml(context, startUrl, outDir);
@@ -772,7 +867,7 @@ async function runCapture(browser, args) {
       pageTitle = mhtmlResult.title;
     } else if (args.scrapeText) {
       console.log(chalk.yellow(`\nScraping text from ${startUrl.href}`));
-      const scrapeResult = await scrapeWebsiteText(context, startUrl, { outDir, maxPages, maxDepth, sameDomainOnly, progressBar });
+      const scrapeResult = await scrapeWebsiteText(context, startUrl, { outDir, maxPages, maxDepth, sameDomainOnly, progressBar, tempPaths: allTempPaths, cleanup: shouldCleanupTemp });
       trackingLog = scrapeResult.trackingLog;
       pageTitle = scrapeResult.title;
     } else if (isPresentation) {
@@ -780,40 +875,36 @@ async function runCapture(browser, args) {
         console.log(chalk.yellow('Note: Saving as images will strip interactive hyperlinks. Use format "pdf" or "pptx" to preserve them natively.'));
       }
       console.log(chalk.yellow(`\nCapturing presentation from ${startUrl.href}`));
-      const crawlResult = await crawlPresentation(context, startUrl, { outDir, imgFormat, maxPages, progressBar });
+      const crawlResult = await crawlPresentation(context, startUrl, { outDir, imgFormat, maxPages, progressBar, tempPaths: allTempPaths, cleanup: shouldCleanupTemp });
       trackingLog = crawlResult.trackingLog;
       pageTitle = crawlResult.title;
-      if (crawlResult.tempPaths) allTempPaths.push(...crawlResult.tempPaths);
     } else {
       console.log(chalk.yellow(`\nCrawling website ${startUrl.href}`));
-      const crawlResult = await crawlWebsite(context, startUrl, { outDir, imgFormat, maxPages, maxDepth, sameDomainOnly, progressBar });
+      const crawlResult = await crawlWebsite(context, startUrl, { outDir, imgFormat, maxPages, maxDepth, sameDomainOnly, progressBar, tempPaths: allTempPaths, cleanup: shouldCleanupTemp });
       trackingLog = crawlResult.trackingLog;
       pageTitle = crawlResult.title;
-      if (crawlResult.tempPaths) allTempPaths.push(...crawlResult.tempPaths);
     }
   } catch (err) {
     if (progressBar.isActive) progressBar.stop();
     console.error(chalk.red(`\nError: ${err.message}`));
-    return;
+    cleanupTemp(true);
+    return false;
   } finally {
     global.isCapturing = false;
     global.abortCapture = false;
     if (progressBar.isActive) progressBar.stop();
+    try {
+      if (options.storageStatePath !== false) {
+        await context.storageState({ path: storageStatePath }).catch(() => {});
+      }
+    } catch (_) {}
     try { await context.close(); } catch (_) {}
   }
 
-  const shouldCleanupTemp = ['pptx', 'docx', 'pdf'].includes(format);
-  const cleanupTemp = () => {
-    if (!shouldCleanupTemp) return;
-    for (const p of allTempPaths) {
-      try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch (_) {}
-    }
-  };
-
   if (!trackingLog || !trackingLog.length) {
     console.log(chalk.red('Nothing was captured.'));
-    cleanupTemp();
-    return;
+    cleanupTemp(true);
+    return false;
   }
 
   const isText = !!args.scrapeText;
@@ -835,9 +926,13 @@ async function runCapture(browser, args) {
       );
       console.log(chalk.green(`\u2714 Saved ${trackingLog.length} files and manifest to ${manifestPath}`));
     }
+  } catch (err) {
+    console.error(chalk.red(`\nError while building output: ${err.message}`));
+    return false;
   } finally {
     cleanupTemp();
   }
+  return true;
 }
 
 // ---------- TUI shell ----------
@@ -851,6 +946,7 @@ function printHelp() {
   console.log(`  ${chalk.cyan('/max <num>')}      Change max pages/slides (current: ${config.maxPages})`);
   console.log(`  ${chalk.cyan('/out <dir>')}      Change output directory (current: ${config.outDir})`);
   console.log(`  ${chalk.cyan('/config')}         Show current settings`);
+  console.log(`  ${chalk.cyan('/headed')}         Toggle headless/headed browser (headed helps solve CAPTCHAs manually)`);
   console.log(`  ${chalk.cyan('clear')}           Clear terminal`);
   console.log(`  ${chalk.cyan('?')} or ${chalk.cyan('/help')}    Show this help`);
   console.log(`  ${chalk.cyan('q')} or ${chalk.cyan('/quit')}    Exit\n`);
@@ -866,7 +962,7 @@ async function runInteractiveShell() {
     prompt: chalk.green('clearpass> ')
   });
 
-  let browser = await chromium.launch();
+  let browser = await chromium.launch({ headless: config.headless !== false });
   let bulkMode = false;
   rl.prompt();
 
@@ -888,6 +984,13 @@ async function runInteractiveShell() {
       console.clear();
     } else if (cmd === '/config') {
       console.log(chalk.cyan(JSON.stringify(config, null, 2)));
+    } else if (cmd === '/headed') {
+      config.headless = !(config.headless !== false);
+      saveConfig(config);
+      console.log(chalk.green(`Browser mode set to ${config.headless ? 'headless' : 'headed'}. Relaunching browser...`));
+      try { await browser.close(); } catch (_) {}
+      browser = await chromium.launch({ headless: config.headless !== false });
+      console.log(chalk.green('Browser relaunched.'));
     } else if (cmd === '/format') {
       if (!arg) console.log(chalk.red('Please specify a format (png, jpeg, pptx, docx, pdf, mhtml).'));
       else {
@@ -944,30 +1047,39 @@ async function runInteractiveShell() {
       if (urls.length > 0) {
         console.log(chalk.cyan(`\nProcessing ${urls.length} URL(s)...\n`));
         console.log(chalk.yellow('\n=== Bulk Mode Started ===\n'));
-        try {
-          for (let i = 0; i < urls.length; i++) {
-            console.log(chalk.blue(`[${i + 1}/${urls.length}] ${urls[i]}`));
+        let successCount = 0;
+        const failedUrls = [];
+        for (let i = 0; i < urls.length; i++) {
+          const targetUrl = urls[i];
+          console.log(chalk.blue(`[${i + 1}/${urls.length}] ${targetUrl}`));
+          let ok = false;
+          for (let attempt = 1; attempt <= 2 && !ok; attempt++) {
+            let bulkBrowser = null;
             try {
-              if (!browser.isConnected()) {
-                console.log(chalk.yellow('\nBrowser disconnected. Relaunching...'));
-                try { await browser.close(); } catch (_) {}
-                browser = await chromium.launch();
-              }
-              await runCapture(browser, { url: urls[i] });
+              bulkBrowser = await chromium.launch({ headless: config.headless !== false });
+              const result = await runCapture(bulkBrowser, { url: targetUrl }, { storageStatePath: config.storageStatePath });
+              ok = result !== false;
+              if (!ok) console.error(chalk.red(`[-] No output produced for ${targetUrl}`));
             } catch (err) {
-              console.error(chalk.red(`[-] Failed to process ${urls[i]}, skipping to next...`));
-              if (err && err.message) console.error(chalk.dim(err.message));
-              // If the browser crashed during capture, relaunch for the next URL.
-              if (!browser.isConnected()) {
-                try { await browser.close(); } catch (_) {}
-                browser = await chromium.launch().catch(() => browser);
+              console.error(chalk.red(`[-] Attempt ${attempt} failed for ${targetUrl}: ${err.message}`));
+            } finally {
+              if (bulkBrowser) {
+                try { await bulkBrowser.close(); } catch (_) {}
               }
             }
-            // Small delay to let the browser release memory between runs.
-            if (i < urls.length - 1) await new Promise(r => setTimeout(r, 1000));
+            if (!ok && attempt < 2) {
+              console.log(chalk.yellow(`Retrying ${targetUrl}...`));
+              await new Promise(r => setTimeout(r, 2000));
+            }
           }
-        } catch (bulkErr) {
-          console.error(chalk.red(`\nBulk processing interrupted: ${bulkErr.message}`));
+          if (ok) successCount++;
+          else failedUrls.push(targetUrl);
+          if (i < urls.length - 1) await new Promise(r => setTimeout(r, 2000));
+        }
+        console.log(chalk.cyan(`\nBulk complete: ${successCount}/${urls.length} succeeded.`));
+        if (failedUrls.length) {
+          console.log(chalk.red('Failed URLs:'));
+          for (const u of failedUrls) console.log(chalk.red(`  - ${u}`));
         }
         console.log(chalk.yellow('\n=== Bulk Mode Finished ===\n'));
       } else {
@@ -1029,10 +1141,12 @@ async function runCliMode() {
     .option('-d, --depth <number>', 'max link depth for website crawls', '0')
     .option('--scrape', 'extract text instead of screenshots')
     .option('--slides', 'treat as a generic presentation (Canva, Pitch, etc.)')
+    .option('--headed', 'show the browser window (helps solve CAPTCHAs manually)')
     .option('--all-domains', 'also follow links to other domains (default: same-domain only)');
 
   program.parse(process.argv);
   const opts = program.opts();
+  if (opts.headed) config.headless = false;
 
   if (!opts.url) {
     if (process.stdout.isTTY) {
@@ -1043,7 +1157,7 @@ async function runCliMode() {
     return;
   }
 
-  const browser = await chromium.launch();
+  const browser = await chromium.launch({ headless: config.headless !== false });
   try {
     await runCapture(browser, {
       url: opts.url,
